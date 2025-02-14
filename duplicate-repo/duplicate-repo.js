@@ -31,12 +31,8 @@ async function copyLabels() {
 
     for (const label of sourceLabels) {
       if (existingLabelNames.includes(label.name)) {
-        // Update the existing label (optional, remove if not needed)
-        await axios.patch(`${GITHUB_API}/${DEST_REPO}/labels/${encodeURIComponent(label.name)}`, {
-          color: label.color,
-          description: label.description || '',
-        }, HEADERS);
-        console.log(`🔄 Updated existing label: ${label.name}`);
+        console.log(`🔄 Skipping existing label: ${label.name}`);
+        continue;
       } else {
         // Create a new label
         await axios.post(`${GITHUB_API}/${DEST_REPO}/labels`, {
