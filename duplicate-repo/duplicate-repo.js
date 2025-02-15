@@ -1,7 +1,6 @@
 require('dotenv').config();
 const axios = require('axios');
 
-// Load environment variables
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
 const SOURCE_REPO = process.env.SOURCE_REPO;
 const DEST_REPO = process.env.DEST_REPO;
@@ -20,79 +19,127 @@ const HEADERS = {
 
 const GITHUB_API = 'https://api.github.com/repos';
 
-async function copyLabels() {
-  try {
-    // Get labels from the destination repo
-    const { data: existingLabels } = await axios.get(`${GITHUB_API}/${DEST_REPO}/labels`, HEADERS);
-    const existingLabelNames = existingLabels.map(label => label.name);
+// Helper function to fetch paginated results
+async function fetchAll(url) {
+  let results = [];
+  let page = 1;
 
-    // Get labels from the source repo
-    const { data: sourceLabels } = await axios.get(`${GITHUB_API}/${SOURCE_REPO}/labels`, HEADERS);
+  while (true) {
+    const { data, headers } = await axios.get(`${url}?per_page=100&page=${page}`, HEADERS);
+    results = results.concat(data);
 
-    for (const label of sourceLabels) {
-      if (existingLabelNames.includes(label.name)) {
-        console.log(`🔄 Skipping existing label: ${label.name}`);
-        continue;
-      } else {
-        // Create a new label
-        await axios.post(`${GITHUB_API}/${DEST_REPO}/labels`, {
-          name: label.name,
-          color: label.color,
-          description: label.description || '',
-        }, HEADERS);
-        console.log(`✅ Created label: ${label.name}`);
-      }
-    }
-  } catch (error) {
-    console.error('❌ Error copying labels:', error.response?.data || error.message);
+    // Check if there's another page
+    if (!headers.link || !headers.link.includes('rel="next"')) break;
+
+    page++;
   }
+
+  return results;
 }
 
+// Fetch all milestones and ensure mapping
 async function copyMilestones() {
   try {
-    const { data: milestones } = await axios.get(`${GITHUB_API}/${SOURCE_REPO}/milestones`, HEADERS);
-    for (const milestone of milestones) {
-      await axios.post(`${GITHUB_API}/${DEST_REPO}/milestones`, {
+    const existingMilestones = await fetchAll(`${GITHUB_API}/${DEST_REPO}/milestones`);
+    const existingMilestoneMap = new Map(existingMilestones.map(m => [m.title, m.number])); // Use titles as keys
+
+    const sourceMilestones = await fetchAll(`${GITHUB_API}/${SOURCE_REPO}/milestones`);
+    const milestoneMap = {};
+
+    for (const milestone of sourceMilestones) {
+      if (existingMilestoneMap.has(milestone.title)) {
+        console.log(`🔄 Skipping existing milestone: ${milestone.title}`);
+        milestoneMap[milestone.number] = existingMilestoneMap.get(milestone.title);
+        continue;
+      }
+
+      const payload = {
         title: milestone.title,
         state: milestone.state,
         description: milestone.description || '',
-        due_on: milestone.due_on,
-      }, HEADERS);
-      console.log(`✅ Milestone copied: ${milestone.title}`);
+      };
+      if (milestone.due_on) payload.due_on = milestone.due_on;
+
+      const { data: newMilestone } = await axios.post(`${GITHUB_API}/${DEST_REPO}/milestones`, payload, HEADERS);
+      milestoneMap[milestone.number] = newMilestone.number;
+      console.log(`✅ Created milestone: ${milestone.title} (New ID: ${newMilestone.number})`);
     }
+
+    return milestoneMap;
   } catch (error) {
     console.error('❌ Error copying milestones:', error.response?.data || error.message);
+    return {};
   }
 }
 
-async function copyIssues() {
-  try {
-    const { data: issues } = await axios.get(`${GITHUB_API}/${SOURCE_REPO}/issues?state=open`, HEADERS);
-    for (const issue of issues) {
-      // Exclude pull requests
-      if (issue.pull_request) continue;
+// Fetch all issues (open and closed)
+async function fetchAllIssues(repo) {
+  let issues = [];
+  for (const state of ["open", "closed"]) {
+    let page = 1;
+    while (true) {
+      const { data, headers } = await axios.get(`${GITHUB_API}/${repo}/issues?state=${state}&per_page=100&page=${page}`, HEADERS);
+      issues = issues.concat(data);
+      if (!headers.link || !headers.link.includes('rel="next"')) break;
+      page++;
+    }
+  }
+  return issues;
+}
 
-      await axios.post(`${GITHUB_API}/${DEST_REPO}/issues`, {
+async function copyIssues(milestoneMap) {
+  try {
+    const existingIssues = await fetchAllIssues(DEST_REPO);
+    const existingIssueMap = new Map(existingIssues.map(issue => [issue.title, issue]));
+
+    const sourceIssues = await fetchAllIssues(SOURCE_REPO);
+
+    for (const issue of sourceIssues) {
+      if (issue.pull_request) continue; // Skip pull requests
+
+      const payload = {
         title: issue.title,
         body: issue.body || '',
         labels: issue.labels.map(l => l.name),
-        milestone: issue.milestone ? issue.milestone.number : null,
-      }, HEADERS);
-      console.log(`✅ Issue copied: ${issue.title}`);
+      };
+
+      if (issue.milestone && milestoneMap[issue.milestone.number]) {
+        payload.milestone = milestoneMap[issue.milestone.number];
+      }
+
+      if (existingIssueMap.has(issue.title)) {
+        const existingIssue = existingIssueMap.get(issue.title);
+
+        // Check if milestone needs to be updated
+        if (
+          issue.milestone &&
+          milestoneMap[issue.milestone.number] &&
+          existingIssue.milestone?.number !== milestoneMap[issue.milestone.number]
+        ) {
+          console.log(`🔄 Updating milestone for issue: ${issue.title}`);
+          await axios.patch(`${GITHUB_API}/${DEST_REPO}/issues/${existingIssue.number}`, {
+            milestone: milestoneMap[issue.milestone.number],
+          }, HEADERS);
+        } else {
+          console.log(`🔄 Skipping existing issue: ${issue.title} (Milestone is correct)`);
+        }
+        continue;
+      }
+
+      // If issue does not exist, create a new one
+      const { data: newIssue } = await axios.post(`${GITHUB_API}/${DEST_REPO}/issues`, payload, HEADERS);
+      console.log(`✅ Created issue: ${newIssue.title} (Milestone: ${newIssue.milestone?.title || "None"})`);
     }
   } catch (error) {
     console.error('❌ Error copying issues:', error.response?.data || error.message);
   }
 }
 
-// Run all functions sequentially
 async function duplicateRepo() {
   console.log('🚀 Starting repository duplication...');
-  await copyLabels();
-  await copyMilestones();
-  await copyIssues();
+  const milestoneMap = await copyMilestones();
+  await copyIssues(milestoneMap);
   console.log('✅ Repository duplication completed successfully!');
 }
 
-// Execute the script
 duplicateRepo();
